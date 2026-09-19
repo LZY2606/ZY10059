@@ -1,0 +1,279 @@
+package failsafegrpc
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	"github.com/failsafe-go/failsafe-go"
+	"github.com/failsafe-go/failsafe-go/fallback"
+	"github.com/failsafe-go/failsafe-go/hedgepolicy"
+	"github.com/failsafe-go/failsafe-go/internal/policytesting"
+	"github.com/failsafe-go/failsafe-go/internal/testutil"
+	"github.com/failsafe-go/failsafe-go/internal/testutil/pbfixtures"
+	"github.com/failsafe-go/failsafe-go/priority"
+	"github.com/failsafe-go/failsafe-go/retrypolicy"
+)
+
+func TestClientSuccess(t *testing.T) {
+	// Given
+	mockedResponse := "pong"
+	server := testutil.MockGrpcResponses(mockedResponse)
+	executor := failsafe.With(NewRetryPolicyBuilder[any]().Build())
+
+	// When / Then
+	testClientSuccess(t, nil, server, executor,
+		1, 1, mockedResponse)
+}
+
+func TestClientRetryPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		code codes.Code
+	}{
+		{
+			"with unavailable error",
+			codes.Unavailable,
+		},
+		{
+			"with deadline exceeded error",
+			codes.DeadlineExceeded,
+		},
+		{
+			"with resource exhausted error",
+			codes.ResourceExhausted,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			mockedErr := status.Error(tc.code, "err")
+			server := testutil.MockGrpcError(mockedErr)
+			executor := failsafe.With(retrypolicy.NewBuilder[any]().ReturnLastFailure().Build())
+
+			// When / Then
+			testClientFailure(t, nil, server, executor,
+				3, 3, mockedErr)
+		})
+	}
+}
+
+func TestClientRetryPolicyWithUnavailableThenSuccess(t *testing.T) {
+	// Given
+	server := testutil.MockFlakyGrpcServer(2, status.Error(codes.Unavailable, "err"), "pong")
+	executor := failsafe.With(NewRetryPolicyBuilder[any]().ReturnLastFailure().Build())
+
+	// When / Then
+	testClientSuccess(t, nil, server, executor,
+		3, 3, "pong")
+}
+
+func TestClientRetryOnResult(t *testing.T) {
+	// Given
+	server := testutil.MockGrpcResponses("retry", "retry", "pong")
+	retryPolicy := NewRetryPolicyBuilder[*pbfixtures.PingResponse]().
+		HandleIf(func(response *pbfixtures.PingResponse, err error) bool {
+			return response.Msg == "retry"
+		}).
+		Build()
+	executor := failsafe.With(retryPolicy)
+
+	// When / Then
+	testClientSuccess(t, nil, server, executor,
+		3, 3, "pong")
+}
+
+func TestClientRetryPolicyFallback(t *testing.T) {
+	// Given
+	server := testutil.MockGrpcError(errors.New("err"))
+	rp := retrypolicy.NewBuilder[*pbfixtures.PingResponse]().ReturnLastFailure().Build()
+	fb := fallback.NewWithFunc(func(exec failsafe.Execution[*pbfixtures.PingResponse]) (*pbfixtures.PingResponse, error) {
+		exec.LastResult().Msg = "pong"
+		return nil, nil
+	})
+	executor := failsafe.With(fb, rp)
+
+	// When / Then
+	testClientSuccess(t, nil, server, executor,
+		3, 3, "pong")
+}
+
+func TestHedgePolicy(t *testing.T) {
+	// Given
+	server := testutil.MockDelayedGrpcResponse("foo", 100*time.Millisecond)
+	stats := &policytesting.Stats{}
+	setup := func() context.Context {
+		stats.Reset()
+		return context.Background()
+	}
+	hp := policytesting.WithHedgeStatsAndLogs(hedgepolicy.NewBuilderWithDelay[*http.Response](80*time.Millisecond), stats).Build()
+	executor := failsafe.With(hp)
+
+	// When / Then
+	testClientSuccess(t, setup, server, executor,
+		2, -1, "foo", func() {
+			assert.Equal(t, 1, stats.Hedges())
+		})
+}
+
+// Asserts that providing a context to either the executor or a request that is canceled results in the execution being canceled.
+func TestClientCancelWithContext(t *testing.T) {
+	slowCtxFn := testutil.ContextWithCancel(time.Second)
+	fastCtxFn := testutil.ContextWithCancel(50 * time.Millisecond)
+
+	tests := []struct {
+		name         string
+		requestCtxFn func() context.Context
+		executorCtx  context.Context
+	}{
+		{
+			"with request context",
+			fastCtxFn,
+			nil,
+		},
+		{
+			"with executor context",
+			nil,
+			fastCtxFn(),
+		},
+		{
+			"with canceling request context and slow executor context",
+			fastCtxFn,
+			slowCtxFn(),
+		},
+		{
+			"with canceling executor context and slow request context",
+			slowCtxFn,
+			fastCtxFn(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			server := testutil.MockDelayedGrpcResponse("pong", time.Second)
+			rp := retrypolicy.NewBuilder[any]().AbortOnErrors(context.Canceled).Build()
+			executor := failsafe.With(rp)
+			if tc.executorCtx != nil {
+				executor = executor.WithContext(tc.executorCtx)
+			}
+
+			// When / Then
+			start := time.Now()
+			testClientFailure(t, tc.requestCtxFn, server, executor,
+				1, 1, context.Canceled)
+			assert.True(t, start.Add(time.Second).After(time.Now()), "cancellation should immediately exit execution")
+		})
+	}
+}
+
+// Asserts that an Executor that's shared by an interceptor is not updated with request scoped contexts, which would
+// cause each call to merge with the previous call's context, after that context has been canceled.
+func TestClientWithRequestScopedContexts(t *testing.T) {
+	// Given
+	server := testutil.MockGrpcResponses("pong")
+	grpcServer, dialer := testutil.GrpcServer(server)
+	executor := failsafe.With(retrypolicy.NewBuilder[*pbfixtures.PingResponse]().AbortOnErrors(context.Canceled).Build())
+	grpcClient := testutil.GrpcClient(dialer, grpc.WithUnaryInterceptor(NewUnaryClientInterceptorWithExecutor(executor)))
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		grpcClient.Close()
+	})
+	client := pbfixtures.NewPingServiceClient(grpcClient)
+
+	// When performing sequential calls, each with a distinct request scoped context
+	type customKey int
+	for i := 1; i <= 3; i++ {
+		ctx := context.WithValue(context.Background(), customKey(i), "foo")
+		response, err := client.Ping(ctx, &pbfixtures.PingRequest{Msg: "ping"})
+
+		// Then
+		if assert.NoError(t, err, "call %d should not be canceled by a previous call's context", i) {
+			assert.Equal(t, "pong", response.Msg)
+		}
+	}
+}
+
+func testClientSuccess[R any](t *testing.T, requestCtxFn func() context.Context, server pbfixtures.PingServiceServer, executor failsafe.Executor[R], expectedAttempts int, expectedExecutions int, expectedResult any, then ...func()) {
+	testClient(t, requestCtxFn, server, executor, expectedAttempts, expectedExecutions, expectedResult, nil, true, then...)
+}
+
+func testClientFailure[R any](t *testing.T, requestCtxFn func() context.Context, server pbfixtures.PingServiceServer, executor failsafe.Executor[R], expectedAttempts int, expectedExecutions int, expectedError error, then ...func()) {
+	testClient(t, requestCtxFn, server, executor, expectedAttempts, expectedExecutions, "", expectedError, false, then...)
+}
+
+func testClientFailureResult[R any](t *testing.T, requestCtxFn func() context.Context, server pbfixtures.PingServiceServer, executor failsafe.Executor[R], expectedAttempts int, expectedExecutions int, expectedResult any, then ...func()) {
+	testClient(t, requestCtxFn, server, executor, expectedAttempts, expectedExecutions, expectedResult, nil, false, then...)
+}
+
+func testClient[R any](t *testing.T, requestCtxFn func() context.Context, server pbfixtures.PingServiceServer, executor failsafe.Executor[R], expectedAttempts int, expectedExecutions int, expectedResult any, expectedError error, expectedSuccess bool, thens ...func()) {
+	t.Helper()
+
+	// Given
+	executorFn, assertResult := testutil.PrepareTest(t, nil, nil, executor)
+	grpcServer, dialer := testutil.GrpcServer(server)
+	grpcClient := testutil.GrpcClient(dialer, grpc.WithUnaryInterceptor(NewUnaryClientInterceptorWithExecutor(executorFn())))
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		grpcClient.Close()
+	})
+	client := pbfixtures.NewPingServiceClient(grpcClient)
+	ctx := context.Background()
+	if requestCtxFn != nil {
+		ctx = requestCtxFn()
+	}
+
+	// When
+	response, err := client.Ping(ctx, &pbfixtures.PingRequest{Msg: "ping"})
+	var msg string
+	if response != nil {
+		msg = response.Msg
+	}
+	assert.Equal(t, expectedResult, msg)
+
+	// Then
+	var nilR R
+	assertResult(expectedAttempts, expectedExecutions, nilR, nilR, expectedError, err, expectedSuccess, !expectedSuccess, false, thens...)
+}
+
+func TestNewUnaryClientInterceptorWithPrioritization(t *testing.T) {
+	interceptor := NewUnaryClientInterceptorWithLevel()
+
+	runTest := func(ctx context.Context) metadata.MD {
+		var resultMD metadata.MD
+		invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+			md, _ := metadata.FromOutgoingContext(ctx)
+			resultMD = md
+			return nil
+		}
+		interceptor(ctx, "", nil, nil, nil, invoker)
+		return resultMD
+	}
+
+	t.Run("should add level to metadata", func(t *testing.T) {
+		ctx := priority.ContextWithLevel(context.Background(), 250)
+		md := runTest(ctx)
+		assert.Equal(t, []string{"250"}, md.Get(levelMetadataKey))
+	})
+
+	t.Run("should add priority to metadata", func(t *testing.T) {
+		ctx := priority.High.AddTo(context.Background())
+		md := runTest(ctx)
+		assert.Equal(t, []string{"3"}, md.Get(priorityMetadataKey))
+	})
+
+	t.Run("should not modify metadata when no level or priority is present", func(t *testing.T) {
+		md := runTest(context.Background())
+		assert.Empty(t, md.Get(levelMetadataKey))
+		assert.Empty(t, md.Get(priorityMetadataKey))
+	})
+}
